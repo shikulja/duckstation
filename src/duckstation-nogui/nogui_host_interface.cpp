@@ -9,6 +9,7 @@
 #include "core/host_display.h"
 #include "core/system.h"
 #include "frontend-common/controller_interface.h"
+#include "frontend-common/d3d12_host_display.h"
 #include "frontend-common/fullscreen_ui.h"
 #include "frontend-common/icon.h"
 #include "frontend-common/imgui_styles.h"
@@ -104,6 +105,10 @@ bool NoGUIHostInterface::CreateDisplay(bool fullscreen)
       break;
 
 #ifdef _WIN32
+    case GPURenderer::HardwareD3D12:
+      m_display = std::make_unique<FrontendCommon::D3D12HostDisplay>();
+      break;
+
     case GPURenderer::HardwareD3D11:
     default:
       m_display = std::make_unique<FrontendCommon::D3D11HostDisplay>();
