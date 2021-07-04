@@ -4,7 +4,7 @@
 #include <cinttypes>
 Log_SetChannel(FrontendCommon);
 
-#ifdef _WIN32
+#if defined(_WIN32) && WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 #include "common/windows_headers.h"
 
 static bool SetScreensaverInhibitWin32(bool inhibit, const WindowInfo& wi)
@@ -93,7 +93,7 @@ static bool SetScreensaverInhibit(bool inhibit, const WindowInfo& wi)
 {
   switch (wi.type)
   {
-#ifdef _WIN32
+#if defined(_WIN32) && WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     case WindowInfo::Type::Win32:
       return SetScreensaverInhibitWin32(inhibit, wi);
 #endif
