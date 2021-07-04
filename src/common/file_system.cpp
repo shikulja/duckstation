@@ -21,6 +21,15 @@
 
 #if defined(_WIN32)
 #include <shlobj.h>
+
+#if defined(_UWP)
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.h>
+#endif
+
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -713,7 +722,8 @@ std::vector<std::string> GetRootDirectoryList()
 {
   std::vector<std::string> results;
 
-#ifdef _WIN32
+#if defined(_WIN32)
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
   char buf[256];
   if (GetLogicalDriveStringsA(sizeof(buf), buf) != 0)
   {
@@ -725,6 +735,29 @@ std::vector<std::string> GetRootDirectoryList()
       ptr += len + 1u;
     }
   }
+#elif defined(_UWP)
+  if (const auto install_location = winrt::Windows::ApplicationModel::Package::Current().InstalledLocation();
+      install_location)
+  {
+    if (const auto path = install_location.Path(); !path.empty())
+      results.push_back(StringUtil::WideStringToUTF8String(path));
+  }
+
+  if (const auto local_location = winrt::Windows::Storage::ApplicationData::Current().LocalFolder(); local_location)
+  {
+    if (const auto path = local_location.Path(); !path.empty())
+      results.push_back(StringUtil::WideStringToUTF8String(path));
+  }
+
+  const auto devices = winrt::Windows::Storage::KnownFolders::RemovableDevices();
+  const auto folders_task(devices.GetFoldersAsync());
+  for (const auto& storage_folder : folders_task.get())
+  {
+    const auto path = storage_folder.Path();
+    if (!path.empty())
+      results.push_back(StringUtil::WideStringToUTF8String(path));
+  }
+#endif
 #else
   const char* home_path = std::getenv("HOME");
   if (home_path)
@@ -1064,7 +1097,7 @@ public:
       m_directoryChangeQueued(false)
   {
     m_bufferSize = 16384;
-    m_pBuffer = new byte[m_bufferSize];
+    m_pBuffer = new u8[m_bufferSize];
   }
 
   virtual ~ChangeNotifierWin32()
@@ -1103,7 +1136,7 @@ public:
     // has any bytes?
     if (bytesRead > 0)
     {
-      const byte* pCurrentPointer = m_pBuffer;
+      const u8* pCurrentPointer = m_pBuffer;
       PathString fileName;
       for (;;)
       {
@@ -1176,15 +1209,26 @@ private:
   HANDLE m_hDirectory;
   OVERLAPPED m_overlapped;
   bool m_directoryChangeQueued;
-  byte* m_pBuffer;
+  u8* m_pBuffer;
   u32 m_bufferSize;
 };
 
 std::unique_ptr<ChangeNotifier> CreateChangeNotifier(const char* path, bool recursiveWatch)
 {
   // open the directory up
-  HANDLE hDirectory = CreateFileA(path, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+  std::wstring path_wstr(StringUtil::UTF8StringToWideString(path));
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+  HANDLE hDirectory =
+    CreateFileW(path_wstr.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+#else
+  CREATEFILE2_EXTENDED_PARAMETERS ep = {};
+  ep.dwSize = sizeof(ep);
+  ep.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+  ep.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED;
+  HANDLE hDirectory = CreateFile2(path_wstr.c_str(), FILE_LIST_DIRECTORY,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, &ep);
+#endif
   if (hDirectory == nullptr)
     return nullptr;
 
@@ -1367,6 +1411,7 @@ bool FileSystem::StatFile(const char* path, FILESYSTEM_STAT_DATA* pStatData)
 
   // test if it is a directory
   HANDLE hFile;
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
   if (fileAttributes & FILE_ATTRIBUTE_DIRECTORY)
   {
     hFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -1377,6 +1422,22 @@ bool FileSystem::StatFile(const char* path, FILESYSTEM_STAT_DATA* pStatData)
     hFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                         OPEN_EXISTING, 0, nullptr);
   }
+#else
+  if (fileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+  {
+    CREATEFILE2_EXTENDED_PARAMETERS ep = {};
+    ep.dwSize = sizeof(ep);
+    ep.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    ep.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;
+    hFile =
+      CreateFile2(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, &ep);
+  }
+  else
+  {
+    hFile =
+      CreateFile2(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, nullptr);
+  }
+#endif
 
   // createfile succeded?
   if (hFile == INVALID_HANDLE_VALUE)
@@ -1664,8 +1725,10 @@ std::string GetProgramPath()
 
   // Fall back to the main module if this fails.
   HMODULE module = nullptr;
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                      reinterpret_cast<LPCWSTR>(&GetProgramPath), &module);
+#endif
 
   for (;;)
   {

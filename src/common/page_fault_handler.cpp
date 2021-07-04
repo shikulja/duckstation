@@ -78,13 +78,24 @@ static bool IsStoreInstruction(const void* ptr)
 }
 #endif
 
-#if defined(_WIN32) && (defined(CPU_X64) || defined(CPU_AARCH64))
+#if defined(WIN32) && (defined(CPU_X64) || defined(CPU_AARCH64))
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 static PVOID s_veh_handle;
+#else
+static PTOP_LEVEL_EXCEPTION_FILTER s_previous_exception_filter;
+#endif // WINAPI_PARTITION_DESKTOP
 
 static LONG ExceptionHandler(PEXCEPTION_POINTERS exi)
 {
   if (exi->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || s_in_handler)
+  {
+#if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    if (s_previous_exception_filter)
+      return s_previous_exception_filter(exi);
+#endif
+
     return EXCEPTION_CONTINUE_SEARCH;
+  }
 
   s_in_handler = true;
 
@@ -110,6 +121,12 @@ static LONG ExceptionHandler(PEXCEPTION_POINTERS exi)
   }
 
   s_in_handler = false;
+
+#if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+  if (s_previous_exception_filter)
+    return s_previous_exception_filter(exi);
+#endif
+
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -222,13 +239,17 @@ bool InstallHandler(void* owner, Callback callback)
 
   if (was_empty)
   {
-#if defined(_WIN32) && (defined(CPU_X64) || defined(CPU_AARCH64))
+#if defined(WIN32) && (defined(CPU_X64) || defined(CPU_AARCH64))
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     s_veh_handle = AddVectoredExceptionHandler(1, ExceptionHandler);
     if (!s_veh_handle)
     {
       Log_ErrorPrint("Failed to add vectored exception handler");
       return false;
     }
+#else
+    s_previous_exception_filter = SetUnhandledExceptionFilter(ExceptionHandler);
+#endif
 #elif defined(USE_SIGSEGV)
 #if 0
     // Alternative stack - we'll need this is we ever use the host stack for branches.
@@ -280,8 +301,18 @@ bool RemoveHandler(void* owner)
   if (m_handlers.empty())
   {
 #if defined(_WIN32) && (defined(CPU_X64) || defined(CPU_AARCH64))
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     RemoveVectoredExceptionHandler(s_veh_handle);
     s_veh_handle = nullptr;
+#else
+    if (SetUnhandledExceptionFilter(s_previous_exception_filter) != ExceptionHandler)
+    {
+      Log_ErrorPrint("Failed to remove exception handler, did something else replace it?");
+      return false;
+    }
+
+    s_previous_exception_filter = nullptr;
+#endif
 #elif defined(USE_SIGSEGV)
     // restore old signal handler
 #if defined(__APPLE__) || defined(__aarch64__)
