@@ -14,6 +14,10 @@ Log_SetChannel(CPU::CodeCache);
 #include "cpu_recompiler_code_generator.h"
 #endif
 
+#ifdef _UWP
+#include "common/windows_headers.h"
+#endif
+
 namespace CPU::CodeCache {
 
 static constexpr bool USE_BLOCK_LINKING = true;
@@ -25,7 +29,7 @@ static constexpr u32 RECOMPILE_COUNT_TO_FALL_BACK_TO_INTERPRETER = 20;
 #ifdef WITH_RECOMPILER
 
 // Currently remapping the code buffer doesn't work in macOS or Haiku.
-#if !defined(__HAIKU__) && !defined(__APPLE__)
+#if !defined(__HAIKU__) && !defined(__APPLE__) && !defined(_UWP)
 #define USE_STATIC_CODE_BUFFER 1
 #endif
 
@@ -50,6 +54,8 @@ static JitCodeBuffer s_code_buffer;
 std::array<CodeBlock::HostCodePointer, FAST_MAP_TOTAL_SLOT_COUNT> s_fast_map;
 DispatcherFunction s_asm_dispatcher;
 SingleBlockDispatcherFunction s_single_block_asm_dispatcher;
+u32 s_asm_dispatcher_size = 0;
+u32 s_single_block_asm_dispatcher_size = 0;
 
 ALWAYS_INLINE static u32 GetFastMapIndex(u32 pc)
 {
@@ -70,6 +76,10 @@ static void SetFastMap(u32 pc, CodeBlock::HostCodePointer function)
 {
   s_fast_map[GetFastMapIndex(pc)] = function;
 }
+
+#ifdef _UWP
+static void InstallUnwindHandler();
+#endif
 
 #endif
 
@@ -161,6 +171,10 @@ void ClearState()
   s_host_code_map.clear();
   s_code_buffer.Reset();
   ResetFastMap();
+
+#ifdef _UWP
+  InstallUnwindHandler();
+#endif
 #endif
 }
 
@@ -294,12 +308,16 @@ void CompileDispatcher()
   s_code_buffer.WriteProtect(false);
 
   {
+    const u32 old_space = s_code_buffer.GetFreeCodeSpace();
     Recompiler::CodeGenerator cg(&s_code_buffer);
     s_asm_dispatcher = cg.CompileDispatcher();
+    s_asm_dispatcher_size = old_space - s_code_buffer.GetFreeCodeSpace();
   }
   {
+    const u32 old_space = s_code_buffer.GetFreeCodeSpace();
     Recompiler::CodeGenerator cg(&s_code_buffer);
     s_single_block_asm_dispatcher = cg.CompileSingleBlockDispatcher();
+    s_single_block_asm_dispatcher_size = old_space - s_code_buffer.GetFreeCodeSpace();
   }
 
   s_code_buffer.WriteProtect(true);
@@ -341,7 +359,14 @@ void ExecuteRecompiler()
     TimingEvents::RunEvents();
   }
 #else
-  s_asm_dispatcher();
+  __try
+  {
+    s_asm_dispatcher();
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER)
+  {
+    Log_ErrorPrintf("exception");
+  }
 #endif
 
   // in case we switch to interpreter...
@@ -503,7 +528,7 @@ recompile:
     if (block->recompile_count >= RECOMPILE_COUNT_TO_FALL_BACK_TO_INTERPRETER)
     {
       Log_PerfPrintf("Block 0x%08X has been recompiled %u times in %u frames, falling back to interpreter",
-        block->GetPC(), block->recompile_count, frame_diff);
+                     block->GetPC(), block->recompile_count, frame_diff);
 
       FallbackExistingBlockToInterpreter(block);
       return false;
@@ -815,6 +840,7 @@ bool InitializeFastmem()
   const CPUFastmemMode mode = g_settings.cpu_fastmem_mode;
   Assert(mode != CPUFastmemMode::Disabled);
 
+#ifndef _UWP
 #ifdef WITH_MMAP_FASTMEM
   const auto handler = (mode == CPUFastmemMode::MMap) ? MMapPageFaultHandler : LUTPageFaultHandler;
 #else
@@ -827,6 +853,9 @@ bool InitializeFastmem()
     Log_ErrorPrintf("Failed to install page fault handler");
     return false;
   }
+#else
+  InstallUnwindHandler();
+#endif
 
   Bus::UpdateFastmemViews(mode);
   CPU::UpdateFastmemBase();
@@ -835,7 +864,9 @@ bool InitializeFastmem()
 
 void ShutdownFastmem()
 {
+#ifndef _UWP
   Common::PageFaultHandler::RemoveHandler(&s_host_code_map);
+#endif
   Bus::UpdateFastmemViews(CPUFastmemMode::Disabled);
   CPU::UpdateFastmemBase();
 }
@@ -958,6 +989,117 @@ Common::PageFaultHandler::HandlerResult LUTPageFaultHandler(void* exception_pc, 
   Log_ErrorPrintf("Loadstore PC not found for %p in block 0x%08X", exception_pc, block->GetPC());
   return Common::PageFaultHandler::HandlerResult::ExecuteNextHandler;
 }
+
+#ifdef _UWP
+
+struct UNWIND_INFO
+{
+  BYTE version : 3;
+  BYTE flags : 5;
+  BYTE size_of_prologue;
+  BYTE count_of_unwind_codes;
+  BYTE frame_register : 4;
+  BYTE frame_offset_scaled : 4;
+  ULONG exception_handler_address;
+};
+
+struct UnwindHandler
+{
+  RUNTIME_FUNCTION runtime_function;
+  UNWIND_INFO unwind_info;
+  uint8_t exception_handler_code[32];
+};
+
+static UnwindHandler* s_runtime_function;
+
+static EXCEPTION_DISPOSITION UnwindExceptionHandler(PEXCEPTION_RECORD ExceptionRecord, ULONG64 EstablisherFrame,
+                                                    PCONTEXT ContextRecord, PDISPATCHER_CONTEXT DispatcherContext)
+{
+#if defined(_M_AMD64)
+  void* const exception_pc = reinterpret_cast<void*>(DispatcherContext->ControlPc);
+#elif defined(_M_ARM64)
+  void* const exception_pc = reinterpret_cast<void*>(DispatcherContext->ControlPc);
+#else
+  void* const exception_pc = nullptr;
+#endif
+
+  void* const exception_address = reinterpret_cast<void*>(ExceptionRecord->ExceptionInformation[1]);
+  bool const is_write = ExceptionRecord->ExceptionInformation[0] == 1;
+
+  Common::PageFaultHandler::HandlerResult result;
+  switch (g_settings.cpu_fastmem_mode)
+  {
+#ifdef WITH_MMAP_FASTMEM
+    case CPUFastmemMode::MMap:
+      result = MMapPageFaultHandler(exception_pc, exception_address, is_write);
+      break;
+#endif
+
+    case CPUFastmemMode::LUT:
+      result = LUTPageFaultHandler(exception_pc, exception_address, is_write);
+      break;
+
+    default:
+      result = Common::PageFaultHandler::HandlerResult::ExecuteNextHandler;
+      break;
+  }
+
+  return (result == Common::PageFaultHandler::HandlerResult::ExecuteNextHandler) ? ExceptionContinueSearch :
+                                                                                   ExceptionContinueExecution;
+}
+
+static PRUNTIME_FUNCTION GetRuntimeFunctionCallback(DWORD64 ControlPc, PVOID Context)
+{
+  if (ControlPc < reinterpret_cast<DWORD64>(s_code_buffer.GetCodePointer()) ||
+      ControlPc >= reinterpret_cast<DWORD64>(s_code_buffer.GetCodePointer() + s_code_buffer.GetTotalSize()))
+  {
+    return nullptr;
+  }
+
+  return &s_runtime_function->runtime_function;
+}
+
+void InstallUnwindHandler()
+{
+  if (!s_code_buffer.IsValid())
+    return;
+
+  if (!RtlInstallFunctionTableCallback(reinterpret_cast<DWORD64>(&InstallUnwindHandler) | 0x3,
+                                       reinterpret_cast<DWORD64>(s_code_buffer.GetCodePointer()),
+                                       s_code_buffer.GetTotalSize(), &GetRuntimeFunctionCallback, nullptr, nullptr))
+  {
+    Panic("Failed to install function table callback");
+    return;
+  }
+
+  UnwindHandler* r = reinterpret_cast<UnwindHandler*>(s_code_buffer.GetFreeCodePointer());
+  r->runtime_function.BeginAddress = sizeof(UnwindHandler);
+  r->runtime_function.EndAddress = s_code_buffer.GetTotalSize();
+  r->runtime_function.UnwindInfoAddress = offsetof(UnwindHandler, unwind_info);
+
+  r->unwind_info.version = 1;
+  r->unwind_info.flags = UNW_FLAG_EHANDLER;
+  r->unwind_info.size_of_prologue = 0;
+  r->unwind_info.count_of_unwind_codes = 0;
+  r->unwind_info.frame_register = 0;
+  r->unwind_info.frame_offset_scaled = 0;
+  r->unwind_info.exception_handler_address = offsetof(UnwindHandler, exception_handler_code);
+
+  // mov rax, handler
+  const void* handler = UnwindExceptionHandler;
+  r->exception_handler_code[0] = 0x48;
+  r->exception_handler_code[1] = 0xb8;
+  std::memcpy(&r->exception_handler_code[2], &handler, sizeof(handler));
+
+  // jmp rax
+  r->exception_handler_code[10] = 0xff;
+  r->exception_handler_code[11] = 0xe0;
+
+  s_code_buffer.CommitCode(sizeof(UnwindHandler));
+  s_runtime_function = r;
+}
+
+#endif
 
 #endif // WITH_RECOMPILER
 
